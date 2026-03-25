@@ -1,0 +1,19 @@
+{
+  "global_rules": {
+    "min_wall_thickness_mm": 3.0,
+    "min_hole_diameter_mm": 2.5,
+    "min_internal_radius_mm": 3.0,
+    "max_pocket_depth_ratio": 4.0,
+    "undercuts_allowed": false
+  },
+  "machine_specific": {
+    "3_axis_cnc": {
+      "max_tool_length_mm": 80,
+      "max_tool_diameter_mm": 12
+    },
+    "5_axis_cnc": {
+      "max_tool_length_mm": 120,
+      "max_tool_diameter_mm": 20
+    }
+  }
+}
