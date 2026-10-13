@@ -1,0 +1,38 @@
+# -------------------------------
+# Backend Dockerfile (supports CadQuery + PostgreSQL)
+# -------------------------------
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# 1️⃣ Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    wget \
+    libgl1 \
+    libglu1-mesa \
+    libxrender1 \
+    libxi6 \
+    libxext6 \
+    libsm6 \
+    libspatialindex-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2️⃣ Upgrade pip
+RUN pip install --upgrade pip
+
+# 3️⃣ Copy and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 4️⃣ Copy application files
+COPY . .
+
+# 5️⃣ Expose backend port
+EXPOSE 8004
+
+# 6️⃣ Ensure unbuffered logs
+ENV PYTHONUNBUFFERED=1
+
+# 7️⃣ Run backend
+CMD ["python", "main.py"]

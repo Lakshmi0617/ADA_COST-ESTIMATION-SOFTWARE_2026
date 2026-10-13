@@ -1,0 +1,4 @@
+docker save -o cost_estimation_frontend.tar deploy_ada_f2-frontend:latest
+docker save -o cost_estimation_backend.tar deploy_ada_f2-backend:latest
+docker save -o deploy_ada_converter.tar deploy_ada_f2-converter:latest
+docker save -o postgres_db.tar postgres:16

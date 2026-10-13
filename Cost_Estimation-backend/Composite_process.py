@@ -1,8 +1,9 @@
 import io
 import tempfile
 from collections import defaultdict
-
+import random
 import numpy as np
+import trimesh
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Form
 from pathlib import Path as FilePath, Path
 import uuid
@@ -658,116 +659,265 @@ async def analyze_step_with_prepreg(
             )
 
         # =================================================
-        # 2. Save STEP file
+        # 2. Save file and detect type
         # =================================================
         with file_path.open("wb") as f:
             shutil.copyfileobj(file.file, f)
 
         # =================================================
-        # 3. Load STEP
+        # 3. Load file based on type
         # =================================================
-        solid = importers.importStep(str(file_path)).val()
-        faces = solid.Faces()
+        file_extension = file.filename.lower().split('.')[-1]
+        print(f"Composite Analysis - Processing file: {file.filename} (type: {file_extension})")
+        
+        if file_extension in ['step', 'stp']:
+            # ---- STEP Processing ----
+            print("Processing STEP file with CadQuery...")
+            solid = importers.importStep(str(file_path)).val()
+            faces = solid.Faces()
 
-        if not faces:
-            raise HTTPException(400, "No faces found in STEP file")
+            if not faces:
+                raise HTTPException(400, "No faces found in STEP file")
+                
+            # Get bounding box from CadQuery
+            bb = solid.BoundingBox()
+            raw_dims = [
+                round(bb.xlen, 2),
+                round(bb.ylen, 2),
+                round(bb.zlen, 2)
+            ]
+            
+        elif file_extension == 'stl':
+            # ---- STL Processing ----
+            print("Processing STL file with Trimesh...")
+            mesh = trimesh.load(str(file_path))
+            
+            # Get bounding box from trimesh
+            bounds = mesh.bounds
+            raw_x_dim = bounds[1][0] - bounds[0][0]  # max_x - min_x
+            raw_y_dim = bounds[1][1] - bounds[0][1]  # max_y - min_y  
+            raw_z_dim = bounds[1][2] - bounds[0][2]  # max_z - min_z
+            
+            # Auto-detect if units need scaling (if max dimension < 100, likely needs scaling)
+            max_raw_dim = max(raw_x_dim, raw_y_dim, raw_z_dim)
+            scale_factor = 1.0
+            
+            print(f"STL Analysis Debug:")
+            print(f"Raw dimensions: X={raw_x_dim:.3f}, Y={raw_y_dim:.3f}, Z={raw_z_dim:.3f}")
+            print(f"Max raw dimension: {max_raw_dim:.3f}")
+            
+            if max_raw_dim < 10:  # Likely in mm, need to scale up
+                scale_factor = 10.0  # Convert to proper scale
+                print(f"Applying scale factor: {scale_factor} (dimensions too small)")
+            elif max_raw_dim > 100000:  # Too large, might need scaling down
+                scale_factor = 1.0  
+                print(f"Applying scale factor: {scale_factor} (dimensions too large)")
+            else:
+                print(f"No scaling needed (scale factor: {scale_factor})")
+                
+            # Apply scaling if needed
+            scaled_x_dim = raw_x_dim * scale_factor
+            scaled_y_dim = raw_y_dim * scale_factor
+            scaled_z_dim = raw_z_dim * scale_factor
+            
+            print(f"Scaled dimensions: X={scaled_x_dim:.3f}, Y={scaled_y_dim:.3f}, Z={scaled_z_dim:.3f}")
+            
+            raw_dims = [
+                round(scaled_x_dim, 2),
+                round(scaled_y_dim, 2),
+                round(scaled_z_dim, 2)
+            ]
+            
+            # For STL files, we need to create a simple solid-like object for face processing
+            # Since trimesh doesn't have the same face structure as CadQuery, we'll use the mesh vertices
+            # to simulate face processing for thickness calculation
+            faces = []  # We'll handle this differently for STL
+            
+        else:
+            raise HTTPException(status_code=400, detail="Only STEP, STP, and STL files are supported")
 
         # =================================================
-        # PART A: THICKNESS (OLD, WORKING LOGIC) – UNCHANGED
+        # PART A: THICKNESS CALCULATION - ADAPTED FOR STL
         # =================================================
-        clusters = defaultdict(list)
+        
+        if file_extension in ['step', 'stp']:
+            # ---- STEP Face-based Thickness Calculation ----
+            clusters = defaultdict(list)
 
-        for f in faces:
-            try:
-                n = f.normalAt()
-                v = np.array([n.x, n.y, n.z])
-                v /= np.linalg.norm(v)
-                key = tuple(np.round(v, 2))
-                clusters[key].append(f)
-            except:
-                pass
+            for f in faces:
+                try:
+                    n = f.normalAt()
+                    v = np.array([n.x, n.y, n.z])
+                    v /= np.linalg.norm(v)
+                    key = tuple(np.round(v, 2))
+                    clusters[key].append(f)
+                except:
+                    pass
 
-        if len(clusters) < 2:
-            raise HTTPException(400, "Unable to cluster shell faces")
+            if len(clusters) < 2:
+                raise HTTPException(400, "Unable to cluster shell faces")
 
-        cluster_list = []
-        for k, fs in clusters.items():
-            area = sum(f.Area() for f in fs)
-            cluster_list.append((k, fs, area))
+            cluster_list = []
+            for k, fs in clusters.items():
+                area = sum(f.Area() for f in fs)
+                cluster_list.append((k, fs, area))
 
-        cluster_list.sort(key=lambda x: x[2], reverse=True)
+            cluster_list.sort(key=lambda x: x[2], reverse=True)
 
-        outer_key, outer_faces, _ = cluster_list[0]
+            outer_key, outer_faces, _ = cluster_list[0]
 
-        inner_faces = None
-        for k, fs, _ in cluster_list[1:]:
-            if np.dot(np.array(k), np.array(outer_key)) < -0.9:
-                inner_faces = fs
-                break
+            inner_faces = None
+            for k, fs, _ in cluster_list[1:]:
+                if np.dot(np.array(k), np.array(outer_key)) < -0.9:
+                    inner_faces = fs
+                    break
 
-        if not inner_faces:
-            raise HTTPException(400, "Inner shell not detected")
+            if not inner_faces:
+                raise HTTPException(400, "Inner shell not detected")
 
-        n = np.array(outer_key)
-        n /= np.linalg.norm(n)
+            n = np.array(outer_key)
+            n /= np.linalg.norm(n)
 
-        outer_proj = [
-            np.dot([f.Center().x, f.Center().y, f.Center().z], n)
-            for f in outer_faces
-        ]
+            outer_proj = [
+                np.dot([f.Center().x, f.Center().y, f.Center().z], n)
+                for f in outer_faces
+            ]
 
-        inner_proj = [
-            np.dot([f.Center().x, f.Center().y, f.Center().z], n)
-            for f in inner_faces
-        ]
+            inner_proj = [
+                np.dot([f.Center().x, f.Center().y, f.Center().z], n)
+                for f in inner_faces
+            ]
 
-        geometric_thickness_mm = round(abs(np.mean(outer_proj) - np.mean(inner_proj)), 3)
+            geometric_thickness_mm = round(abs(np.mean(outer_proj) - np.mean(inner_proj)), 3)
+            
+        elif file_extension == 'stl':
+            # ---- STL Mesh-based Thickness Calculation ----
+            print("Calculating thickness from STL mesh...")
+            
+            # For STL files, we'll use a simplified approach based on mesh properties
+            # Calculate thickness as the difference between max and min Z coordinates
+            # This is a simplified approach suitable for most composite parts
+            
+            # Get mesh face normals and Z coordinates
+            face_normals = mesh.face_normals
+            vertices = mesh.vertices
+            normals = mesh.vertex_normals
+
+            samples = min(200, len(vertices))
+            thickness_values = []
+            
+            indices = np.linspace(0, len(vertices) - 1, samples, dtype=int)
+            for i in indices:
+                origin = vertices[i]
+                direction = -normals[i]
+
+                locations, index_ray, index_tri = mesh.ray.intersects_location(
+                    ray_origins=[origin],
+                    ray_directions=[direction]
+                )
+
+                if len(locations) > 0:
+                    dist = np.linalg.norm(locations[0] - origin)
+                    if dist > 0:
+                        thickness_values.append(dist)
+
+            if not thickness_values:
+                raise Exception("Unable to compute thickness from STL")
+
+            geometric_thickness_mm = round(np.median(thickness_values), 3)
+
+            print(f"STL thickness (ray-based): {geometric_thickness_mm}")
+            
+            # Find the dominant direction (most common normal orientation)
+            # This helps us identify the "thickness" direction
+            
+        
+            
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file type for thickness calculation")
 
         # =================================================
-        # PART B: SURFACE AREA (UNCHANGED)
+        # PART B: SURFACE AREA CALCULATION - ADAPTED FOR STL
         # =================================================
-        bb = solid.BoundingBox()
+        
+        if file_extension in ['step', 'stp']:
+            # ---- STEP Face-based Surface Area Calculation ----
+            bb = solid.BoundingBox()
 
-        shape = importers.importStep(str(file_path)).val()
-        solids = shape.Solids()
+            shape = importers.importStep(str(file_path)).val()
+            solids = shape.Solids()
 
-        if not solids:
-            raise HTTPException(400, "No solids found in STEP file")
+            if not solids:
+                raise HTTPException(400, "No solids found in STEP file")
 
-        first_part = solids[0]
-        faces = first_part.Faces()
+            first_part = solids[0]
+            faces = first_part.Faces()
 
-        face_centers = []
-        face_data = []
+            face_centers = []
+            face_data = []
 
-        for face in faces:
-            area_mm2 = face.Area()
-            c = face.Center()
-            center = np.array([c.x, c.y, c.z])
+            for face in faces:
+                area_mm2 = face.Area()
+                c = face.Center()
+                center = np.array([c.x, c.y, c.z])
 
-            n = face.normalAt()
-            normal = np.array([n.x, n.y, n.z])
-            normal /= np.linalg.norm(normal)
+                n = face.normalAt()
+                normal = np.array([n.x, n.y, n.z])
+                normal /= np.linalg.norm(normal)
 
-            face_centers.append(center)
-            face_data.append((center, normal, area_mm2))
+                face_centers.append(center)
+                face_data.append((center, normal, area_mm2))
 
-        part_center = np.mean(face_centers, axis=0)
+            part_center = np.mean(face_centers, axis=0)
 
-        inner_area_mm2 = 0.0
+            inner_area_mm2 = 0.0
 
-        for center, normal, area in face_data:
-            if np.dot(normal, center - part_center) < 0:
-                inner_area_mm2 += area
+            for center, normal, area in face_data:
+                if np.dot(normal, center - part_center) < 0:
+                    inner_area_mm2 += area
 
-        ply_area_m2 = round(inner_area_mm2 / 1e6, 3)
+            ply_area_m2 = round(inner_area_mm2 / 1e6, 3)
+            
+        elif file_extension == 'stl':
+            # ---- STL Mesh-based Surface Area Calculation ----
+            print("Calculating surface area from STL mesh...")
+            
+            # For STL files, use the mesh area directly
+            # Calculate total surface area and estimate inner surface area
+            total_area_mm2 = mesh.area  # Total surface area in mm²
+            
+            # For composite parts, we typically use about 50% of total area as inner surface area
+            # This is a reasonable approximation for hollow/thin-walled parts
+            triangles = mesh.triangles
+            normals = mesh.face_normals
+            areas = mesh.area_faces
 
-        raw_dims = [
-            round(bb.xlen, 2),
-            round(bb.ylen, 2),
-            round(bb.zlen, 2)
-        ]
+            centroids = triangles.mean(axis=1)
+            part_center = centroids.mean(axis=0)
 
+            inner_area_mm2 = 0.0
+            for i in range(len(triangles)):
+                center = centroids[i]
+                normal = normals[i]
+                area = areas[i]
+
+    # same logic as STEP
+                direction = center - part_center
+                direction = direction / np.linalg.norm(direction)
+
+                dot_val = np.dot(normal, direction)
+                if dot_val < -0.19:
+                    inner_area_mm2 += area
+
+            ply_area_m2 = round(inner_area_mm2 / 1e6, 3)
+
+            print(f"STL inner surface area: {ply_area_m2} m²")
+
+            
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file type for surface area calculation")
+
+        # Use the raw_dims that were already calculated above
         # Sort: largest → length, second → width, smallest → height
         raw_dims_sorted = sorted(raw_dims, reverse=True)
 
@@ -789,6 +939,19 @@ async def analyze_step_with_prepreg(
         mass_in_kg=prepreg.density_kg_m3*volume_of_part_m3
 
         volume_of_composite_tool_in_m3=(stock_length*stock_width*stock_height)/1000000000
+
+        # Debug prints for verification
+        print(f"=== Composite Analysis Results ===")
+        print(f"File type: {file_extension}")
+        print(f"Global dimensions: L={global_length:.2f}, W={global_width:.2f}, H={global_height:.2f} mm")
+        print(f"Geometric thickness: {geometric_thickness_mm:.3f} mm")
+        print(f"Ply area: {ply_area_m2:.3f} m²")
+        print(f"Number of layers: {number_of_layers:.1f}")
+        print(f"Total surface area: {total_surface_area_m2:.3f} m²")
+        print(f"Part volume: {volume_of_part_m3:.6f} m³")
+        print(f"Part mass: {mass_in_kg:.3f} kg")
+        print(f"Stock volume: {volume_of_composite_tool_in_m3:.6f} m³")
+        print("=" * 35)
 
         master_tool = db.query(MasterToolCost).first()
 
@@ -4430,3 +4593,275 @@ def update_part_fabrication_correction_factor(
         "correction": row.correction,
         "created_at": row.created_at
     }
+
+
+
+
+@router.post("/analyze-iges-composites/")
+async def analyze_iges_with_prepreg(
+    file: UploadFile = File(...),
+    material_id: int = Form(...),
+    db: Session = Depends(get_db)
+):
+    import uuid, shutil, numpy as np
+    from collections import defaultdict
+    import cadquery as cq
+
+    from OCP.IGESControl import IGESControl_Reader
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_SOLID
+
+    upload_dir = FilePath("uploads")
+    upload_dir.mkdir(exist_ok=True)
+    file_path = upload_dir / f"{uuid.uuid4()}_{file.filename}"
+
+    try:
+        # =================================================
+        # 1. MATERIAL FETCH (SAME AS STEP)
+        # =================================================
+        prepreg = db.query(CompositesPrepregCost).filter(
+            CompositesPrepregCost.id == material_id
+        ).first()
+
+        if not prepreg:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Prepreg material with id={material_id} not found"
+            )
+
+        # =================================================
+        # 2. SAVE FILE
+        # =================================================
+        with file_path.open("wb") as f:
+            shutil.copyfileobj(file.file, f)
+
+        # =================================================
+        # 3. LOAD IGES (ONLY CHANGE)
+        # =================================================
+        reader = IGESControl_Reader()
+        status = reader.ReadFile(str(file_path))
+
+        if status != 1:
+            raise HTTPException(400, "Failed to read IGES")
+
+        reader.TransferRoots()
+        shape = reader.OneShape()
+
+        explorer = TopExp_Explorer(shape, TopAbs_SOLID)
+        solids = []
+        while explorer.More():
+            solids.append(explorer.Current())
+            explorer.Next()
+
+        if not solids:
+            raise HTTPException(400, "No solid found")
+
+        shape = solids[0]
+
+        solid = cq.Shape(shape)
+
+        # =================================================
+        # 🔥 BOUNDING BOX (SAME AS YOUR WORKING IGES LOGIC)
+        # =================================================
+        bb = solid.BoundingBox()
+        raw_dims = [
+            round(bb.xlen, 2),
+            round(bb.ylen, 2),
+            round(bb.zlen, 2)
+        ]
+
+        faces = solid.Faces()
+
+        if not faces:
+            raise HTTPException(400, "No faces found")
+
+        # =================================================
+        # THICKNESS (UNCHANGED)
+        # =================================================
+        clusters = defaultdict(list)
+
+        for f in faces:
+            try:
+                n = f.normalAt()
+                v = np.array([n.x, n.y, n.z])
+                v /= np.linalg.norm(v)
+                key = tuple(np.round(v, 2))
+                clusters[key].append(f)
+            except:
+                pass
+
+        if len(clusters) < 2:
+            raise HTTPException(400, "Unable to cluster shell faces")
+
+        cluster_list = []
+        for k, fs in clusters.items():
+            area = sum(f.Area() for f in fs)
+            cluster_list.append((k, fs, area))
+
+        cluster_list.sort(key=lambda x: x[2], reverse=True)
+
+        outer_key, outer_faces, _ = cluster_list[0]
+
+        inner_faces = None
+        for k, fs, _ in cluster_list[1:]:
+            if np.dot(np.array(k), np.array(outer_key)) < -0.9:
+                inner_faces = fs
+                break
+
+        if not inner_faces:
+            raise HTTPException(400, "Inner shell not detected")
+
+        n = np.array(outer_key)
+        n /= np.linalg.norm(n)
+
+        outer_proj = [
+            np.dot([f.Center().x, f.Center().y, f.Center().z], n)
+            for f in outer_faces
+        ]
+
+        inner_proj = [
+            np.dot([f.Center().x, f.Center().y, f.Center().z], n)
+            for f in inner_faces
+        ]
+
+        geometric_thickness_mm = round(abs(np.mean(outer_proj) - np.mean(inner_proj)), 3)
+
+        # =================================================
+        # SURFACE AREA (UNCHANGED)
+        # =================================================
+        face_centers = []
+        face_data = []
+
+        for face in faces:
+            area_mm2 = face.Area()
+            c = face.Center()
+            center = np.array([c.x, c.y, c.z])
+
+            n = face.normalAt()
+            normal = np.array([n.x, n.y, n.z])
+            normal /= np.linalg.norm(normal)
+
+            face_centers.append(center)
+            face_data.append((center, normal, area_mm2))
+
+        part_center = np.mean(face_centers, axis=0)
+
+        inner_area_mm2 = 0.0
+        for center, normal, area in face_data:
+            if np.dot(normal, center - part_center) < 0:
+                inner_area_mm2 += area
+
+        ply_area_m2 = round(inner_area_mm2 / 1e6, 3)
+
+        # =================================================
+        # DIMENSIONS
+        # =================================================
+        raw_dims_sorted = sorted(raw_dims, reverse=True)
+
+        global_length = raw_dims_sorted[0]
+        global_width = raw_dims_sorted[1]
+        global_height = raw_dims_sorted[2]
+
+        # =================================================
+        # STOCK + CALCULATIONS (SAME)
+        # =================================================
+        stock_length = global_length + 100
+        stock_width = global_width + 100
+        stock_height = global_height
+
+        number_of_layers = geometric_thickness_mm / prepreg.thickness_mm
+        total_surface_area_m2 = number_of_layers * ply_area_m2
+        volume_of_part_m3 = (geometric_thickness_mm * ply_area_m2) / 1000
+        mass_in_kg = prepreg.density_kg_m3 * volume_of_part_m3
+        volume_of_composite_tool_in_m3 = (stock_length * stock_width * stock_height) / 1e9
+
+        master_tool = db.query(MasterToolCost).first()
+
+        if not master_tool:
+            raise HTTPException(404, "Master tool cost table is empty")
+
+        Tool_Stock_weight_Kg = (
+            master_tool.epoxy_block_density * volume_of_composite_tool_in_m3
+        )
+
+        # =================================================
+        # 🔥 TYPE SAFETY (CRITICAL)
+        # =================================================
+        geometric_thickness_mm = float(geometric_thickness_mm)
+        ply_area_m2 = float(ply_area_m2)
+        number_of_layers = float(number_of_layers)
+        total_surface_area_m2 = float(total_surface_area_m2)
+        volume_of_part_m3 = float(volume_of_part_m3)
+        mass_in_kg = float(mass_in_kg)
+        volume_of_composite_tool_in_m3 = float(volume_of_composite_tool_in_m3)
+        Tool_Stock_weight_Kg = float(Tool_Stock_weight_Kg)
+
+        # =================================================
+        # DB INSERT (IDENTICAL TO STEP)
+        # =================================================
+        analysis_row = CompositeAnalysisResult(
+            filename=file.filename,
+            prepreg_material_id=prepreg.id,
+            material=prepreg.material,
+            spec=prepreg.spec,
+            density_kg_m3=float(prepreg.density_kg_m3),
+            design_thickness_mm=float(prepreg.thickness_mm),
+            prepreg_cost_per_kg=float(prepreg.prepreg_cost_per_kg),
+            stock_length_mm=float(stock_length),
+            stock_width_mm=float(stock_width),
+            stock_height_mm=float(stock_height),
+            geometric_thickness_mm=geometric_thickness_mm,
+            one_ply_surface_area_m2=ply_area_m2,
+            number_of_layers=number_of_layers,
+            total_surface_area_m2=total_surface_area_m2,
+            volume_of_part_m3=volume_of_part_m3,
+            mass_in_kg=mass_in_kg,
+            volume_of_composite_tool_in_m3=volume_of_composite_tool_in_m3,
+            tool_stock_weight_kg=Tool_Stock_weight_Kg
+        )
+
+        db.add(analysis_row)
+        db.commit()
+        db.refresh(analysis_row)
+
+        # =================================================
+        # 🔥 RESPONSE (NOW MATCHES STEP ENDPOINT)
+        # =================================================
+        return {
+            "filename": file.filename,
+
+            "material": {
+                "id": prepreg.id,
+                "material": prepreg.material,
+                "spec": prepreg.spec,
+                "density_kg_m3": prepreg.density_kg_m3,
+                "design_thickness_mm": prepreg.thickness_mm,
+                "prepreg_cost_per_kg": prepreg.prepreg_cost_per_kg
+            },
+
+            "geometry": {
+                "global_dimensions_mm": {
+                    "length": global_length,
+                    "width": global_width,
+                    "height": global_height
+                },
+                "stock_dimensions_mm": {
+                    "stock_length": stock_length,
+                    "stock_width": stock_width,
+                    "stock_height": stock_height
+                },
+                "geometric_thickness_mm": geometric_thickness_mm,
+                "one_ply_surface_area_m2": ply_area_m2
+            },
+
+            "number_of_layers": number_of_layers,
+            "total_surface_area_m2": total_surface_area_m2,
+            "volume_of_part_m3": volume_of_part_m3,
+            "mass_in_kg": mass_in_kg,
+            "volume_of_composite_tool_in_m3": volume_of_composite_tool_in_m3,
+            "Tool_Stock_weight_Kg": Tool_Stock_weight_Kg,
+            "analysis_id": analysis_row.id
+        }
+
+    finally:
+        file_path.unlink(missing_ok=True)

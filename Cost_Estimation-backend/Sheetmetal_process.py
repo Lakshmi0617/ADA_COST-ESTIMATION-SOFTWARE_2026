@@ -18,6 +18,7 @@ from pathlib import Path
 import shutil
 import uuid
 import cadquery as cq
+import trimesh
 from typing import List, Dict
 from models import SheetmetalParameters, Sheet_metal_Materials, SheetmetalMachineHourRate, SheetmetalToolingCost, \
     SheetmetalPercentages, SheetmetalManufacturingPercentage, SheetMetalHistory, SheetmetalCalculationResult
@@ -323,14 +324,77 @@ async def analyze_step_files(
             shutil.copyfileobj(file.file, buffer)
 
         try:
-            model = cq.importers.importStep(str(file_path))
-            shape = model.val()
-            bb = shape.BoundingBox()
+            # ---- File Type Detection and Processing ----
+            file_extension = file.filename.lower().split('.')[-1]
+            print(f"Sheet Metal Analysis - Processing file: {file.filename} (type: {file_extension})")
+            
+            if file_extension in ['step', 'stp']:
+                # ---- STEP Processing ----
+                print("Processing STEP file with CadQuery...")
+                model = cq.importers.importStep(str(file_path))
+                shape = model.val()
+                bb = shape.BoundingBox()
 
-            x_dim = bb.xmax - bb.xmin
-            y_dim = bb.ymax - bb.ymin
-            z_dim = bb.zmax - bb.zmin
+                x_dim = bb.xmax - bb.xmin
+                y_dim = bb.ymax - bb.ymin
+                z_dim = bb.zmax - bb.zmin
 
+                part_volume_mm3 = shape.Volume()
+                part_volume_m3 = part_volume_mm3 / 1e9
+                
+                print(f"STEP dimensions: X={x_dim:.2f}, Y={y_dim:.2f}, Z={z_dim:.2f}, Volume={part_volume_mm3:.2f} mm³")
+                
+            elif file_extension == 'stl':
+                # ---- STL Processing ----
+                print("Processing STL file with Trimesh...")
+                mesh = trimesh.load(str(file_path))
+                
+                # Get bounding box from trimesh
+                bounds = mesh.bounds
+                raw_x_dim = bounds[1][0] - bounds[0][0]  # max_x - min_x
+                raw_y_dim = bounds[1][1] - bounds[0][1]  # max_y - min_y  
+                raw_z_dim = bounds[1][2] - bounds[0][2]  # max_z - min_z
+                
+                # Auto-detect if units need scaling (if max dimension < 100, likely needs scaling)
+                max_raw_dim = max(raw_x_dim, raw_y_dim, raw_z_dim)
+                scale_factor = 1.0
+                
+                print(f"STL Analysis Debug:")
+                print(f"Raw dimensions: X={raw_x_dim:.3f}, Y={raw_y_dim:.3f}, Z={raw_z_dim:.3f}")
+                print(f"Max raw dimension: {max_raw_dim:.3f}")
+                
+                if max_raw_dim < 10:  # Likely in mm, need to scale up
+                    scale_factor = 10.0  # Convert to proper scale
+                    print(f"Applying scale factor: {scale_factor} (dimensions too small)")
+                elif max_raw_dim > 10000:  # Too large, might need scaling down
+                    scale_factor = 0.1
+                    print(f"Applying scale factor: {scale_factor} (dimensions too large)")
+                else:
+                    print(f"No scaling needed (scale factor: {scale_factor})")
+                    
+                # Apply scaling if needed
+                x_dim = raw_x_dim * scale_factor
+                y_dim = raw_y_dim * scale_factor
+                z_dim = raw_z_dim * scale_factor
+                
+                print(f"Scaled dimensions: X={x_dim:.3f}, Y={y_dim:.3f}, Z={z_dim:.3f}")
+                
+                # Calculate volume using trimesh with proper scaling
+                part_volume_mm3 = mesh.volume * (scale_factor ** 3)
+                part_volume_m3 = part_volume_mm3 / 1e9
+                
+                # Convert numpy types to regular Python types if needed
+                x_dim = float(x_dim)
+                y_dim = float(y_dim)
+                z_dim = float(z_dim)
+                part_volume_mm3 = float(part_volume_mm3)
+                
+                print(f"STL dimensions: X={x_dim:.2f}, Y={y_dim:.2f}, Z={z_dim:.2f}, Volume={part_volume_mm3:.2f} mm³")
+                
+            else:
+                raise HTTPException(status_code=400, detail="Only STEP, STP, and STL files are supported")
+
+            # ---- Common Processing for All File Types ----
             dims_sorted = sorted(
                 [(x_dim, 'X'), (y_dim, 'Y'), (z_dim, 'Z')],
                 reverse=True,
@@ -340,9 +404,6 @@ async def analyze_step_files(
             length = dims_sorted[0][0]
             breadth = dims_sorted[1][0]
             height = dims_sorted[2][0]
-
-            part_volume_mm3 = shape.Volume()
-            part_volume_m3 = part_volume_mm3 / 1e9
 
             # ---- TOOL LOGIC (UNCHANGED) ----
             TOOL_HEIGHT = 50
@@ -423,7 +484,7 @@ async def analyze_step_files(
     if len(files) != 3:
         raise HTTPException(
             status_code=400,
-            detail="Please upload either 1 STEP file or exactly 3 STEP files."
+            detail="Please upload either 1 STEP/STL file or exactly 3 STEP/STL files."
         )
 
     analyzed = []
@@ -436,13 +497,77 @@ async def analyze_step_files(
             shutil.copyfileobj(file.file, buffer)
 
         try:
-            model = cq.importers.importStep(str(file_path))
-            shape = model.val()
-            bb = shape.BoundingBox()
+            # ---- File Type Detection and Processing ----
+            file_extension = file.filename.lower().split('.')[-1]
+            print(f"Sheet Metal Analysis - Processing file: {file.filename} (type: {file_extension})")
+            
+            if file_extension in ['step', 'stp']:
+                # ---- STEP Processing ----
+                print("Processing STEP file with CadQuery...")
+                model = cq.importers.importStep(str(file_path))
+                shape = model.val()
+                bb = shape.BoundingBox()
 
-            x_dim = bb.xmax - bb.xmin
-            y_dim = bb.ymax - bb.ymin
-            z_dim = bb.zmax - bb.zmin
+                x_dim = bb.xmax - bb.xmin
+                y_dim = bb.ymax - bb.ymin
+                z_dim = bb.zmax - bb.zmin
+
+                volume_mm3 = shape.Volume()
+                volume_m3 = volume_mm3 / 1e9
+                
+                print(f"STEP dimensions: X={x_dim:.2f}, Y={y_dim:.2f}, Z={z_dim:.2f}, Volume={volume_mm3:.2f} mm³")
+                
+            elif file_extension == 'stl':
+                # ---- STL Processing ----
+                print("Processing STL file with Trimesh...")
+                mesh = trimesh.load(str(file_path))
+                
+                # Get bounding box from trimesh
+                bounds = mesh.bounds
+                raw_x_dim = bounds[1][0] - bounds[0][0]  # max_x - min_x
+                raw_y_dim = bounds[1][1] - bounds[0][1]  # max_y - min_y  
+                raw_z_dim = bounds[1][2] - bounds[0][2]  # max_z - min_z
+                
+                # Auto-detect if units need scaling (if max dimension < 100, likely needs scaling)
+                max_raw_dim = max(raw_x_dim, raw_y_dim, raw_z_dim)
+                scale_factor = 1.0
+                
+                print(f"STL Analysis Debug:")
+                print(f"Raw dimensions: X={raw_x_dim:.3f}, Y={raw_y_dim:.3f}, Z={raw_z_dim:.3f}")
+                print(f"Max raw dimension: {max_raw_dim:.3f}")
+                
+                if max_raw_dim < 100:  # Likely in mm, need to scale up
+                    scale_factor = 10.0  # Convert to proper scale
+                    print(f"Applying scale factor: {scale_factor} (dimensions too small)")
+                elif max_raw_dim > 1000:  # Too large, might need scaling down
+                    scale_factor = 0.1
+                    print(f"Applying scale factor: {scale_factor} (dimensions too large)")
+                else:
+                    print(f"No scaling needed (scale factor: {scale_factor})")
+                    
+                # Apply scaling if needed
+                x_dim = raw_x_dim * scale_factor
+                y_dim = raw_y_dim * scale_factor
+                z_dim = raw_z_dim * scale_factor
+                
+                print(f"Scaled dimensions: X={x_dim:.3f}, Y={y_dim:.3f}, Z={z_dim:.3f}")
+                
+                # Calculate volume using trimesh with proper scaling
+                volume_mm3 = mesh.volume * (scale_factor ** 3)
+                volume_m3 = volume_mm3 / 1e9
+                
+                # Convert numpy types to regular Python types if needed
+                x_dim = float(x_dim)
+                y_dim = float(y_dim)
+                z_dim = float(z_dim)
+                volume_mm3 = float(volume_mm3)
+                
+                print(f"STL dimensions: X={x_dim:.2f}, Y={y_dim:.2f}, Z={z_dim:.2f}, Volume={volume_mm3:.2f} mm³")
+                
+            else:
+                raise HTTPException(status_code=400, detail="Only STEP, STP, and STL files are supported")
+
+            # ---- Common Processing for All File Types ----
 
             dims_sorted = sorted(
                 [(x_dim, 'X'), (y_dim, 'Y'), (z_dim, 'Z')],
@@ -3197,3 +3322,279 @@ async def get_sheetmetal_history_cost_by_id(history_id: int, db: Session = Depen
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching sheet metal history cost details: {str(e)}")
 
+
+
+@router.post("/analyze-iges-sheetmetal/")
+async def analyze_iges_sheetmetal(
+    files: list[UploadFile] = File(...),
+    material_id: int = Form(...),
+    quantity: int = Form(1),
+    db: Session = Depends(get_db)
+):
+    import os
+    import uuid
+    import shutil
+    from datetime import datetime
+    import cadquery as cq
+
+    from OCP.IGESControl import IGESControl_Reader
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_SOLID
+    from OCP.GProp import GProp_GProps
+    from OCP.BRepGProp import BRepGProp
+
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded")
+
+    material = db.query(models.Sheet_metal_Materials).filter(
+        models.Sheet_metal_Materials.id == material_id
+    ).first()
+
+    if not material or material.density is None:
+        raise HTTPException(status_code=404, detail="Invalid material")
+
+    material_name = material.material.strip()
+    material_density = material.density
+    material_cost = material.material_cost
+
+    # =====================================================
+    # 🔹 FUNCTION: LOAD + BBOX USING OCP + CADQUERY
+    # =====================================================
+    def process_iges(file_path):
+        reader = IGESControl_Reader()
+        status = reader.ReadFile(file_path)
+
+        if status != 1:
+            raise Exception("Failed to read IGES")
+
+        reader.TransferRoots()
+        shape = reader.OneShape()
+
+        if shape.IsNull():
+            raise Exception("Invalid IGES")
+
+        # Extract solid
+        explorer = TopExp_Explorer(shape, TopAbs_SOLID)
+        solids = []
+        while explorer.More():
+            solids.append(explorer.Current())
+            explorer.Next()
+
+        if not solids:
+            raise Exception("No solid found")
+
+        shape = solids[0]
+
+        # 🔥 BOUNDING BOX (CadQuery)
+        cq_shape = cq.Shape(shape)
+        part = cq.Workplane("XY").newObject([cq_shape])
+        bb = part.val().BoundingBox()
+
+        x_dim = bb.xlen
+        y_dim = bb.ylen
+        z_dim = bb.zlen
+
+        dims_sorted = sorted(
+            [(x_dim, 'X'), (y_dim, 'Y'), (z_dim, 'Z')],
+            reverse=True,
+            key=lambda x: x[0]
+        )
+
+        length = dims_sorted[0][0]
+        breadth = dims_sorted[1][0]
+        height = dims_sorted[2][0]
+
+        # Volume
+        props = GProp_GProps()
+        BRepGProp.VolumeProperties_s(shape, props)
+        volume_mm3 = props.Mass()
+
+        return {
+            "length": length,
+            "breadth": breadth,
+            "height": height,
+            "volume_mm3": volume_mm3,
+            "volume_m3": volume_mm3 / 1e9
+        }
+
+    try:
+        # =====================================================
+        # 🔷 CASE 1: SINGLE FILE
+        # =====================================================
+        if len(files) == 1:
+            file = files[0]
+
+            if not file.filename.lower().endswith((".igs", ".iges")):
+                raise HTTPException(status_code=400, detail="Upload IGES file")
+
+            file_path = f"uploads/{uuid.uuid4()}_{file.filename}"
+            os.makedirs("uploads", exist_ok=True)
+
+            with open(file_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+
+            try:
+                result = process_iges(file_path)
+
+                length = int(round(result["length"], 2))
+                breadth = int(round(result["breadth"], 2))
+                height = round(result["height"], 2)
+
+                part_volume_mm3 = result["volume_mm3"]
+                part_volume_m3 = result["volume_m3"]
+
+                # TOOL LOGIC (same)
+                TOOL_HEIGHT = 50
+                TOOL_FACTOR = 0.7
+
+                tool_volume_mm3 = length * breadth * TOOL_HEIGHT * TOOL_FACTOR
+                tool_volume_m3 = tool_volume_mm3 / 1e9
+
+                part_simple = {
+                    "filename": file.filename,
+                    "length": length,
+                    "breadth": breadth,
+                    "height": height,
+                    "volume_mm3": round(part_volume_mm3, 2),
+                    "volume_m3": round(part_volume_m3, 10)
+                }
+
+                male_tool_simple = {
+                    "filename": file.filename,
+                    "length": length,
+                    "breadth": breadth,
+                    "height": TOOL_HEIGHT,
+                    "volume_mm3": round(tool_volume_mm3, 2),
+                    "volume_m3": round(tool_volume_m3, 10)
+                }
+
+                female_tool_simple = male_tool_simple
+
+                history = models.SheetMetalHistory(
+                    filename_female=file.filename,
+                    filename_male=file.filename,
+                    filename_part=file.filename,
+                    female_tool=female_tool_simple,
+                    male_tool=male_tool_simple,
+                    part=part_simple,
+                    material_id=material_id,
+                    material_name=material_name,
+                    material_density=material_density,
+                    material_cost=material_cost,
+                    quantity=quantity,
+                    created_at=datetime.utcnow()
+                )
+
+                db.add(history)
+                db.commit()
+                db.refresh(history)
+
+                return {
+                    "history_id": history.id,
+                    "material": {
+                        "id": material_id,
+                        "name": material_name,
+                        "density": material_density,
+                        "cost": material_cost
+                    },
+                    "quantity": quantity,
+                    "part": part_simple,
+                    "male_tool": male_tool_simple,
+                    "female_tool": female_tool_simple
+                }
+
+            finally:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+
+        # =====================================================
+        # 🔷 CASE 2: THREE FILES
+        # =====================================================
+        if len(files) != 3:
+            raise HTTPException(status_code=400, detail="Upload 1 or 3 IGES files")
+
+        analyzed = []
+
+        for file in files:
+            if not file.filename.lower().endswith((".igs", ".iges")):
+                raise HTTPException(status_code=400, detail="Only IGES files allowed")
+
+            file_path = f"uploads/{uuid.uuid4()}_{file.filename}"
+
+            with open(file_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+
+            try:
+                result = process_iges(file_path)
+
+                analyzed.append({
+                    "filename": file.filename,
+                    "length": result["length"],
+                    "breadth": result["breadth"],
+                    "height": result["height"],
+                    "volume_mm3": result["volume_mm3"],
+                    "volume_m3": result["volume_m3"]
+                })
+
+            finally:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+
+        analyzed.sort(key=lambda r: r["volume_m3"], reverse=True)
+
+        female_tool = analyzed[0]
+        male_tool = analyzed[1]
+        part = analyzed[2]
+
+        def simplify(tool):
+            return {
+                "filename": tool["filename"],
+                "length": round(tool["length"], 2),
+                "breadth": round(tool["breadth"], 2),
+                "height": round(tool["height"], 2),
+                "volume_mm3": round(tool["volume_mm3"]),
+                "volume_m3": round(tool["volume_m3"], 10)
+            }
+
+        female_tool_simple = simplify(female_tool)
+        male_tool_simple = simplify(male_tool)
+        part_simple = simplify(part)
+
+        history = models.SheetMetalHistory(
+            filename_female=female_tool["filename"],
+            filename_male=male_tool["filename"],
+            filename_part=part["filename"],
+            female_tool=female_tool_simple,
+            male_tool=male_tool_simple,
+            part=part_simple,
+            material_id=material_id,
+            material_name=material_name,
+            material_density=material_density,
+            material_cost=material_cost,
+            quantity=quantity,
+            created_at=datetime.utcnow()
+        )
+
+        db.add(history)
+        db.commit()
+        db.refresh(history)
+
+        return {
+            "history_id": history.id,
+            "material": {
+                "id": material_id,
+                "name": material_name,
+                "density": material_density,
+                "cost": material_cost
+            },
+            "quantity": quantity,
+            "female_tool": female_tool_simple,
+            "male_tool": male_tool_simple,
+            "part": part_simple
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        db.close()

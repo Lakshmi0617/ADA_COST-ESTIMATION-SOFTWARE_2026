@@ -1,9 +1,10 @@
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
+import os
 
 # Database connection URL
-DATABASE_URL = "postgresql://postgres:siri2251105@localhost:5432/Cost_estimation"
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:root1234@localhost:5432/Cost_estimation")
 
 # Create SQLAlchemy engine
 engine = create_engine(DATABASE_URL)

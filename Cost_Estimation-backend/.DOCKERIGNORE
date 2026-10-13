@@ -1,0 +1,17 @@
+__pycache__
+*.pyc
+*.pyo
+.git
+.gitignore
+uploads
+output
+input
+node_modules
+dist
+build
+*.stp
+*.step
+*.stl
+*.obj
+*.iges
+*.igs

@@ -14,6 +14,7 @@ from pathlib import Path
 import shutil
 import cadquery as cq
 import math
+import trimesh
 
 from starlette.requests import Request
 from starlette.responses import StreamingResponse, JSONResponse
@@ -213,8 +214,10 @@ async def analyze_step_file(
         quantity: int = Form(1),
         db: Session = Depends(get_db)
 ):
-    unique_filename = f"{uuid.uuid4()}_{file.filename}"
+    clean_filename = Path(file.filename).name
+    unique_filename = f"{uuid.uuid4()}_{clean_filename}"
     file_path = Path("uploads") / unique_filename
+    file_path.parent.mkdir(parents=True, exist_ok=True)
     with file_path.open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
@@ -407,6 +410,215 @@ async def analyze_step_file(
             "material_name": material_name,
             "density": density,
             "quantity": quantity,
+            "actual_dimensions": {
+                "length": round(length, 2),
+                "breadth": round(breadth, 2),
+                "height": round(height, 2),
+                "volume_mm3": round(volume_mm3),
+                "volume_m3": round(volume_m3, 10)
+            },
+            "stock_dimensions": {
+                "length": stock_L,
+                "breadth": stock_B,
+                "height": stock_H,
+                "volume_mm3": round(stock_volume_mm3),
+                "volume_m3": round(stock_volume_m3, 10)
+            },
+            "raw_extra": {"δX": δX, "δY": δY, "δZ": δZ}
+        }
+
+    finally:
+        file_path.unlink(missing_ok=True)
+
+
+@router.post("/analyze-stl/")
+async def analyze_stl_file(
+        file: UploadFile = File(...),
+        material_id: int = Form(...),
+        quantity: int = Form(1),
+        db: Session = Depends(get_db)
+):
+    # Validate file type
+    if not file.filename.lower().endswith(('.stl')):
+        raise HTTPException(status_code=400, detail="Only STL files are allowed")
+    
+    clean_filename = Path(file.filename).name
+    unique_filename = f"{uuid.uuid4()}_{clean_filename}"
+    file_path = Path("uploads") / unique_filename
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    with file_path.open("wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    try:
+        # --- Fetch material ---
+        material_obj = db.query(models.Materials).filter(models.Materials.id == material_id).first()
+        if not material_obj or material_obj.density is None:
+            raise HTTPException(status_code=404, detail="Material not found or invalid density")
+
+        density = material_obj.density
+        material_name = material_obj.material.strip()
+
+        # --- STL file analysis ---
+        # Load STL using trimesh
+        mesh = trimesh.load(str(file_path))
+        
+        # Check if the mesh needs unit conversion
+        # STL files don't have explicit units, so we need to detect scale
+        # If dimensions seem too small, assume they're in mm and need conversion
+        bounds = mesh.bounds
+        raw_x_dim = bounds[1][0] - bounds[0][0]  # max_x - min_x
+        raw_y_dim = bounds[1][1] - bounds[0][1]  # max_y - min_y  
+        raw_z_dim = bounds[1][2] - bounds[0][2]  # max_z - min_z
+        
+        # Auto-detect if units need scaling (if max dimension < 100, likely needs scaling)
+        max_raw_dim = max(raw_x_dim, raw_y_dim, raw_z_dim)
+        scale_factor = 1.0
+        
+        print(f"STL Analysis Debug:")
+        print(f"Raw dimensions: X={raw_x_dim:.3f}, Y={raw_y_dim:.3f}, Z={raw_z_dim:.3f}")
+        print(f"Max raw dimension: {max_raw_dim:.3f}")
+        
+        if max_raw_dim < 1000:  # Likely in mm, need to scale up
+            scale_factor = 10.0  # Convert to proper scale
+            print(f"Applying scale factor: {scale_factor} (dimensions too small)")
+        elif max_raw_dim > 1000:  # Too large, might need scaling down
+            scale_factor = 0.01
+
+            print(f"Applying scale factor: {scale_factor} (dimensions too large)")
+        else:
+            print(f"No scaling needed (scale factor: {scale_factor})")
+            
+        # Apply scaling if needed
+        # x_dim = raw_x_dim * scale_factor
+        # y_dim = raw_y_dim * scale_factor
+        # z_dim = raw_z_dim * scale_factor
+        x_dim = raw_x_dim 
+        y_dim = raw_y_dim 
+        z_dim = raw_z_dim 
+        
+        print(f"Scaled dimensions: X={x_dim:.3f}, Y={y_dim:.3f}, Z={z_dim:.3f}")
+        
+        # Calculate volume with proper scaling
+        volume_mm3 = mesh.volume * (scale_factor ** 3)
+        volume_m3 = volume_mm3 / 1e9
+        
+        # Determine length, breadth, height (sorted by size)
+        dims_sorted = sorted([(x_dim, 'X'), (y_dim, 'Y'), (z_dim, 'Z')],
+                             reverse=True, key=lambda x: x[0])
+        length, breadth, height = dims_sorted[0][0], dims_sorted[1][0], dims_sorted[2][0]
+        
+        # Convert numpy types to regular Python types
+        length = float(length)
+        breadth = float(breadth) 
+        height = float(height)
+        volume_mm3 = float(volume_mm3)
+        volume_m3 = float(volume_m3)
+        
+        # For STL files, we use the mesh properties directly
+        # No complex alignment needed since STL is already a mesh
+
+        # --- Helper functions ---
+        def round_to_nearest(value, base):
+            return int(base * round(float(value) / base))
+
+        def get_raw_extra(L, B, H):
+            """Return δL, δB, δH individually based on each dimension."""
+            # For Length
+            if L <= 50:
+                δL = 20
+            elif L <= 100:
+                δL = 30
+            elif L <= 200:
+                δL = 30
+            elif L <= 500:
+                δL = 50
+            elif L <= 1000:
+                δL = 100
+            elif L <= 2000:
+                δL = 100
+            else:
+                δL = 100
+
+            # For Breadth
+            if B <= 50:
+                δB = 20
+            elif B <= 100:
+                δB = 30
+            elif B <= 200:
+                δB = 30
+            elif B <= 500:
+                δB = 50
+            elif B <= 1000:
+                δB = 100
+            elif B <= 2000:
+                δB = 100
+            else:
+                δB = 100
+
+            # For Height
+            if H <= 50:
+                δH = 5
+            elif H <= 100:
+                δH = 5
+            elif H <= 200:
+                δH = 5
+            elif H <= 500:
+                δH = 10
+            elif H <= 1000:
+                δH = 10
+            elif H <= 2000:
+                δH = 10
+            else:
+                δH = 10
+
+            return δL, δB, δH
+
+        δX, δY, δZ = get_raw_extra(length, breadth, height)
+
+        stock_L = round_to_nearest(length + δX, 10)
+        stock_B = round_to_nearest(breadth + δY, 10)
+        stock_H = round_to_nearest(height + δZ, 5)
+
+        stock_volume_mm3 = stock_L * stock_B * stock_H
+        stock_volume_m3 = stock_volume_mm3 / 1e9
+
+        # --- Store results ---
+        history = models.MillingHistoryDetails(
+            filename=file.filename,
+            material_id=material_id,
+            material_name=material_name,
+            density=density,
+            quantity=quantity,
+            actual_length=round(length, 2),
+            actual_breadth=round(breadth, 2),
+            actual_height=round(height, 2),
+            actual_volume_mm3=round(volume_mm3),
+            actual_volume_m3=round(volume_m3, 10),
+            stock_length=stock_L,
+            stock_breadth=stock_B,
+            stock_height=stock_H,
+            stock_volume_mm3=round(stock_volume_mm3),
+            stock_volume_m3=round(stock_volume_m3, 10),
+            delta_x=δX,
+            delta_y=δY,
+            delta_z=δZ,
+        )
+
+        db.add(history)
+        db.commit()
+        db.refresh(history)
+
+        print(f"✅ Inserted MillingHistoryDetails with history_id={history.id}")
+
+        return {
+            "id": history.id,
+            "filename": file.filename,
+            "material_id": material_id,
+            "material_name": material_name,
+            "density": density,
+            "quantity": quantity,
+            "file_type": "STL",
+            "analysis_type": "cadquery_stl",
             "actual_dimensions": {
                 "length": round(length, 2),
                 "breadth": round(breadth, 2),
@@ -2267,4 +2479,250 @@ async def get_milling_history_cost_by_id(milling_history_id: int, db: Session = 
     return combined_data
 
 
+    
+@router.post("/analyze-iges-milling/")
+async def analyze_iges_file(
+        file: UploadFile = File(...),
+        material_id: int = Form(...),
+        quantity: int = Form(1),
+        db: Session = Depends(get_db)
+):
+    import numpy as np
+    import cadquery as cq
+    from pathlib import Path
+    import shutil
+    import uuid
 
+    from OCP.IGESControl import IGESControl_Reader
+    from OCP.GProp import GProp_GProps
+    from OCP.BRepGProp import BRepGProp
+    from OCP.gp import gp_Trsf, gp_Vec, gp_Dir, gp_Ax3, gp_Pnt
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_SOLID
+
+    clean_filename = Path(file.filename).name
+    unique_filename = f"{uuid.uuid4()}_{clean_filename}"
+    file_path = Path("uploads") / unique_filename
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with file_path.open("wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    try:
+        # =========================
+        # 📦 MATERIAL FETCH
+        # =========================
+        material_obj = db.query(models.Materials).filter(
+            models.Materials.id == material_id
+        ).first()
+
+        if not material_obj or material_obj.density is None:
+            raise HTTPException(status_code=404, detail="Material not found")
+
+        density = material_obj.density
+        material_name = material_obj.material.strip()
+
+        # =========================
+        # 📥 LOAD IGES
+        # =========================
+        reader = IGESControl_Reader()
+        status = reader.ReadFile(str(file_path))
+
+        if status != 1:
+            raise HTTPException(status_code=500, detail="Failed to read IGES")
+
+        reader.TransferRoots()
+        shape = reader.OneShape()
+
+        if shape.IsNull():
+            raise HTTPException(status_code=500, detail="Empty shape")
+
+        # =========================
+        # 🔥 EXTRACT SOLID
+        # =========================
+        explorer = TopExp_Explorer(shape, TopAbs_SOLID)
+
+        solids = []
+        while explorer.More():
+            solids.append(explorer.Current())
+            explorer.Next()
+
+        if not solids:
+            raise HTTPException(status_code=500, detail="No solid found in IGES")
+
+        shape = solids[0]
+
+        part = cq.Workplane("XY").newObject([cq.Shape(shape)])
+
+        # =========================
+        # 🔥 PCA
+        # =========================
+        props = GProp_GProps()
+        BRepGProp.VolumeProperties_s(part.val().wrapped, props)
+
+        com = props.CentreOfMass()
+
+        inertia = props.MatrixOfInertia()
+        I = np.array([
+            [inertia.Value(1, 1), inertia.Value(1, 2), inertia.Value(1, 3)],
+            [inertia.Value(2, 1), inertia.Value(2, 2), inertia.Value(2, 3)],
+            [inertia.Value(3, 1), inertia.Value(3, 2), inertia.Value(3, 3)]
+        ])
+
+        eigvals, eigvecs = np.linalg.eigh(I)
+        eigvecs = eigvecs / np.linalg.norm(eigvecs, axis=0)
+
+        # --- Rotation ---
+        rot_trsf = gp_Trsf()
+        dir_x = gp_Dir(*eigvecs[:, 0])
+        dir_z = gp_Dir(*eigvecs[:, 2])
+        local_cs = gp_Ax3(gp_Pnt(0, 0, 0), dir_z, dir_x)
+        rot_trsf.SetTransformation(local_cs)
+
+        # --- Translation ---
+        trans_trsf = gp_Trsf()
+        trans_trsf.SetTranslation(gp_Vec(-com.X(), -com.Y(), -com.Z()))
+
+        # --- Combine ---
+        final_trsf = rot_trsf.Multiplied(trans_trsf)
+
+        location = TopLoc_Location(final_trsf)
+        aligned_shape = part.val().wrapped.Moved(location)
+
+        aligned_part = cq.Workplane("XY").newObject([cq.Shape(aligned_shape)])
+
+        # =========================
+        # 📦 CENTER BB
+        # =========================
+        bb = aligned_part.val().BoundingBox()
+        center = (
+            (bb.xmin + bb.xmax) / 2,
+            (bb.ymin + bb.ymax) / 2,
+            (bb.zmin + bb.zmax) / 2
+        )
+
+        aligned_part = aligned_part.translate((-center[0], -center[1], -center[2]))
+
+        # =========================
+        # 📏 DIMENSIONS
+        # =========================
+        bb = aligned_part.val().BoundingBox()
+
+        x_dim = bb.xlen
+        y_dim = bb.ylen
+        z_dim = bb.zlen
+
+        dims_sorted = sorted(
+            [(x_dim, 'X'), (y_dim, 'Y'), (z_dim, 'Z')],
+            reverse=True,
+            key=lambda x: x[0]
+        )
+
+        length, breadth, height = dims_sorted[0][0], dims_sorted[1][0], dims_sorted[2][0]
+
+        # =========================
+        # 📦 VOLUME
+        # =========================
+        volume_mm3 = aligned_part.val().Volume()
+        volume_m3 = volume_mm3 / 1e9
+
+        # =========================
+        # 📏 STOCK LOGIC (same as STEP)
+        # =========================
+        def round_to_nearest(value, base):
+            return int(base * round(float(value) / base))
+
+        def get_raw_extra(L, B, H):
+            if L <= 50: δL = 20
+            elif L <= 100: δL = 30
+            elif L <= 200: δL = 30
+            elif L <= 500: δL = 50
+            elif L <= 1000: δL = 100
+            elif L <= 2000: δL = 100
+            else: δL = 100
+
+            if B <= 50: δB = 20
+            elif B <= 100: δB = 30
+            elif B <= 200: δB = 30
+            elif B <= 500: δB = 50
+            elif B <= 1000: δB = 100
+            elif B <= 2000: δB = 100
+            else: δB = 100
+
+            if H <= 50: δH = 5
+            elif H <= 100: δH = 5
+            elif H <= 200: δH = 5
+            elif H <= 500: δH = 10
+            elif H <= 1000: δH = 10
+            elif H <= 2000: δH = 10
+            else: δH = 10
+
+            return δL, δB, δH
+
+        δX, δY, δZ = get_raw_extra(length, breadth, height)
+
+        stock_L = round_to_nearest(length + δX, 10)
+        stock_B = round_to_nearest(breadth + δY, 10)
+        stock_H = round_to_nearest(height + δZ, 5)
+
+        stock_volume_mm3 = stock_L * stock_B * stock_H
+        stock_volume_m3 = stock_volume_mm3 / 1e9
+
+        # =========================
+        # 💾 DATABASE INSERT (NEW)
+        # =========================
+        history = models.MillingHistoryDetails(
+            filename=file.filename,
+            material_id=material_id,
+            material_name=material_name,
+            density=density,
+            quantity=quantity,
+            actual_length=round(length, 2),
+            actual_breadth=round(breadth, 2),
+            actual_height=round(height, 2),
+            actual_volume_mm3=round(volume_mm3),
+            actual_volume_m3=round(volume_m3, 10),
+            stock_length=stock_L,
+            stock_breadth=stock_B,
+            stock_height=stock_H,
+            stock_volume_mm3=round(stock_volume_mm3),
+            stock_volume_m3=round(stock_volume_m3, 10),
+            delta_x=δX,
+            delta_y=δY,
+            delta_z=δZ,
+        )
+
+        db.add(history)
+        db.commit()
+        db.refresh(history)
+
+        # =========================
+        # 📤 RESPONSE (same as STEP)
+        # =========================
+        return {
+            "id": history.id,
+            "filename": file.filename,
+            "material_id": material_id,
+            "material_name": material_name,
+            "density": density,
+            "quantity": quantity,
+            "actual_dimensions": {
+                "length": round(length, 2),
+                "breadth": round(breadth, 2),
+                "height": round(height, 2),
+                "volume_mm3": round(volume_mm3),
+                "volume_m3": round(volume_m3, 10)
+            },
+            "stock_dimensions": {
+                "length": stock_L,
+                "breadth": stock_B,
+                "height": stock_H,
+                "volume_mm3": round(stock_volume_mm3),
+                "volume_m3": round(stock_volume_m3, 10)
+            },
+            "raw_extra": {"δX": δX, "δY": δY, "δZ": δZ}
+        }
+
+    finally:
+        file_path.unlink(missing_ok=True)

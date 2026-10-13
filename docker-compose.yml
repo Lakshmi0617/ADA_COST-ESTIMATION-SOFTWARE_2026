@@ -1,0 +1,68 @@
+
+
+
+
+
+# version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: postgres_db
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: 12345
+      POSTGRES_DB: Cost_estimation
+    ports:
+      - "7000:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ./Cost_Estimation-backend
+      dockerfile: Dockerfile
+    container_name: cost_estimation_backend
+    restart: always
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgresql://postgres:12345@postgres:5432/Cost_estimation
+    ports:
+      - "8004:8004"
+    volumes:
+      - ./Cost_Estimation-backend:/app
+
+  converter:
+    build:
+      context: ./Cost_Estimation-converter   # ✅ correct folder name
+      dockerfile: Dockerfile
+    container_name: converter_service
+    restart: always
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgresql://postgres:12345@postgres:5432/Cost_estimation
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./Cost_Estimation-converter:/app
+      - ./Cost_Estimation-converter/input:/app/input
+      - ./Cost_Estimation-converter/output:/app/output
+
+
+  frontend:
+    build:
+      context: ./Cost_estimation-frontend
+      dockerfile: Dockerfile
+    container_name: cost_estimation_frontend
+    restart: always
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+      - converter
+
+volumes:
+  pgdata:

@@ -22,6 +22,7 @@ from pathlib import Path
 import shutil
 import uuid
 import cadquery as cq
+import trimesh
 
 
 # below used to extract dimension and also calculate material cost and which all possible parameters and stored in db
@@ -38,14 +39,73 @@ async def get_bounding_box(
         shutil.copyfileobj(file.file, buffer)
 
     try:
-        # ---- STEP Processing ----
-        model = cq.importers.importStep(str(file_path))
-        shape = model.val()
-        bb = shape.BoundingBox()
+        # ---- File Type Detection and Processing ----
+        file_extension = file.filename.lower().split('.')[-1]
+        print(f"Turning Analysis - Processing file: {file.filename} (type: {file_extension})")
+        
+        if file_extension in ['step', 'stp']:
+            # ---- STEP Processing ----
+            print("Processing STEP file with CadQuery...")
+            model = cq.importers.importStep(str(file_path))
+            shape = model.val()
+            bb = shape.BoundingBox()
 
-        x_dim = bb.xmax - bb.xmin
-        y_dim = bb.ymax - bb.ymin
-        z_dim = bb.zmax - bb.zmin
+            x_dim = bb.xmax - bb.xmin
+            y_dim = bb.ymax - bb.ymin
+            z_dim = bb.zmax - bb.zmin
+
+            volume_mm3 = round(shape.Volume(), 2)  # mm³
+            print(f"STEP dimensions: X={x_dim:.2f}, Y={y_dim:.2f}, Z={z_dim:.2f}, Volume={volume_mm3:.2f} mm³")
+            
+        elif file_extension == 'stl':
+            # ---- STL Processing ----
+            print("Processing STL file with Trimesh...")
+            mesh = trimesh.load(str(file_path))
+            
+            # Get bounding box from trimesh
+            bounds = mesh.bounds
+            raw_x_dim = bounds[1][0] - bounds[0][0]  # max_x - min_x
+            raw_y_dim = bounds[1][1] - bounds[0][1]  # max_y - min_y  
+            raw_z_dim = bounds[1][2] - bounds[0][2]  # max_z - min_z
+            
+            # Auto-detect if units need scaling (if max dimension < 100, likely needs scaling)
+            max_raw_dim = max(raw_x_dim, raw_y_dim, raw_z_dim)
+            scale_factor = 1.0
+            
+            print(f"STL Analysis Debug:")
+            print(f"Raw dimensions: X={raw_x_dim:.3f}, Y={raw_y_dim:.3f}, Z={raw_z_dim:.3f}")
+            print(f"Max raw dimension: {max_raw_dim:.3f}")
+            
+            if max_raw_dim < 10:  # Likely in mm, need to scale up
+                scale_factor = 10.0  # Convert to proper scale
+                print(f"Applying scale factor: {scale_factor} (dimensions too small)")
+            elif max_raw_dim > 10000:  # Too large, might need scaling down
+                scale_factor = 0.1
+                print(f"Applying scale factor: {scale_factor} (dimensions too large)")
+            else:
+                print(f"No scaling needed (scale factor: {scale_factor})")
+                
+            # Apply scaling if needed
+            x_dim = raw_x_dim * scale_factor
+            y_dim = raw_y_dim * scale_factor
+            z_dim = raw_z_dim * scale_factor
+            
+            print(f"Scaled dimensions: X={x_dim:.3f}, Y={y_dim:.3f}, Z={z_dim:.3f}")
+            
+            # Calculate volume using trimesh with proper scaling
+            volume_mm3 = mesh.volume * (scale_factor ** 3)
+            
+            # Convert numpy types to regular Python types if needed
+            x_dim = float(x_dim)
+            y_dim = float(y_dim)
+            z_dim = float(z_dim)
+            
+            print(f"STL dimensions: X={x_dim:.2f}, Y={y_dim:.2f}, Z={z_dim:.2f}, Volume={volume_mm3:.2f} mm³")
+            
+        else:
+            raise HTTPException(status_code=400, detail="Only STEP, STP, and STL files are supported")
+
+        # ---- Common Processing for All File Types ----
 
         dims_sorted = sorted(
             [(x_dim, "X"), (y_dim, "Y"), (z_dim, "Z")],
@@ -59,8 +119,6 @@ async def get_bounding_box(
         )
 
         # ---- Volume ----
-
-        volume_mm3 = round(shape.Volume(), 2)  # mm³
         volume_m3 = round(volume_mm3 / 1e9, 10)  # m³
 
         # ---- Fetch Material ----
@@ -166,6 +224,27 @@ async def get_bounding_box(
         roughing_time = ((material_removed_mm3 * (roughing_percentage / 100)) / roughing_mrr_mm3_min) / 60
         finishing_time = (material_removed_mm3 * (finishing_percentage / 100)) / finishing_mrr_mm3_min / 60
         machining_hours = (roughing_time + finishing_time)
+
+        # ---- Convert all numpy types to regular Python types before database storage ----
+        length = float(length)
+        breadth = float(breadth)
+        height = float(height)
+        volume_mm3 = float(volume_mm3)
+        volume_m3 = float(volume_m3)
+        diameter = float(diameter)
+        axis_length = float(axis_length)
+        stock_length = float(stock_length)
+        stock_diameter = float(stock_diameter)
+        stock_volume_mm3 = float(stock_volume_mm3)
+        stock_volume_m3 = float(stock_volume_m3)
+        material_removed_m3 = float(material_removed_m3)
+        stock_weight = float(stock_weight)
+        material_cost = float(material_cost)
+        roughing_mrr_mm3_min = float(roughing_mrr_mm3_min)
+        finishing_mrr_mm3_min = float(finishing_mrr_mm3_min)
+        roughing_time = float(roughing_time)
+        finishing_time = float(finishing_time)
+        machining_hours = float(machining_hours)
 
         history = TurningHistoryDetails(
             filename=file.filename,
@@ -2761,3 +2840,315 @@ async def get_turning_history_cost_by_id(history_id: int, db: Session = Depends(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching turning history cost: {str(e)}")
+
+
+@router.post("/bounding-box-iges-turning/")
+async def get_bounding_box_iges(
+    file: UploadFile = File(...),
+    material_id: int = Form(...),
+    db: Session = Depends(get_db)
+):
+    import os
+    import uuid
+    import math
+    import shutil
+
+    from pathlib import Path
+    from fastapi import HTTPException
+
+    import cadquery as cq
+
+    from OCP.IGESControl import IGESControl_Reader
+    from OCP.GProp import GProp_GProps
+    from OCP.BRepGProp import BRepGProp
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_SOLID
+
+    # ---------------------------
+    # VALIDATION
+    # ---------------------------
+    if not file.filename.lower().endswith((".igs", ".iges")):
+        raise HTTPException(status_code=400, detail="Upload IGES file")
+
+    unique_filename = f"{uuid.uuid4()}_{file.filename}"
+    file_path = Path("uploads") / unique_filename
+    file_path.parent.mkdir(exist_ok=True)
+
+    with file_path.open("wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    try:
+        # ---------------------------
+        # LOAD IGES (OCP)
+        # ---------------------------
+        reader = IGESControl_Reader()
+        status = reader.ReadFile(str(file_path))
+
+        if status != 1:
+            raise HTTPException(status_code=500, detail="Failed to read IGES")
+
+        reader.TransferRoots()
+        shape = reader.OneShape()
+
+        if shape.IsNull():
+            raise HTTPException(status_code=400, detail="Invalid IGES file")
+
+        # ---------------------------
+        # EXTRACT SOLID (same as before)
+        # ---------------------------
+        explorer = TopExp_Explorer(shape, TopAbs_SOLID)
+        solids = []
+
+        while explorer.More():
+            solids.append(explorer.Current())
+            explorer.Next()
+
+        if not solids:
+            raise HTTPException(status_code=400, detail="No solid found in IGES")
+
+        shape = solids[0]
+
+        # ---------------------------
+        # 🔥 FIXED BOUNDING BOX (CadQuery)
+        # ---------------------------
+        cq_shape = cq.Shape(shape)
+        part = cq.Workplane("XY").newObject([cq_shape])
+
+        bb = part.val().BoundingBox()
+
+        x_dim = bb.xlen
+        y_dim = bb.ylen
+        z_dim = bb.zlen
+
+        dims_sorted = sorted(
+            [(x_dim, "X"), (y_dim, "Y"), (z_dim, "Z")],
+            reverse=True,
+            key=lambda x: x[0]
+        )
+
+        length = round(dims_sorted[0][0], 2)
+        breadth = round(dims_sorted[1][0], 2)
+        height = round(dims_sorted[2][0], 2)
+
+        # ---------------------------
+        # VOLUME (same)
+        # ---------------------------
+        props = GProp_GProps()
+        BRepGProp.VolumeProperties_s(shape, props)
+        volume_mm3 = round(props.Mass(), 2)
+        volume_m3 = round(volume_mm3 / 1e9, 10)
+
+        # ---------------------------
+        # MATERIAL FETCH (same as old)
+        # ---------------------------
+        material = db.query(models.TurningMaterials).filter(
+            models.TurningMaterials.id == material_id
+        ).first()
+
+        if not material:
+            raise HTTPException(status_code=404, detail="Material not found")
+
+        # ---------------------------
+        # DERIVED PARAMETERS (same)
+        # ---------------------------
+        diameter = None
+        axis_length = None
+
+        if length == breadth or length == height:
+            diameter = length
+            axis_length = breadth if length == height else height
+        elif breadth == height:
+            diameter = breadth
+            axis_length = length
+        else:
+            threshold = 20
+            diffs = [
+                (abs(length - breadth), (length, breadth, height)),
+                (abs(length - height), (length, height, breadth)),
+                (abs(breadth - height), (breadth, height, length)),
+            ]
+            close_pair = min(diffs, key=lambda x: x[0])
+            if close_pair[0] <= threshold:
+                a, b, other = close_pair[1]
+                diameter = max(a, b)
+                axis_length = other
+
+        diameter = math.floor(diameter + 0.5)
+
+        # ---------------------------
+        # STOCK CALCULATION (same)
+        # ---------------------------
+        stock_length = axis_length + 50
+        stock_diameter = diameter + 10
+
+        stock_volume_mm3 = round(math.pi * (stock_diameter ** 2) * stock_length / 4, 2)
+        stock_volume_m3 = round(stock_volume_mm3 / 1e9, 10)
+
+        density = material.density
+        cost_per_kg = material.material_cost
+
+        material_removed_m3 = stock_volume_m3 - volume_m3
+        material_removed_mm3 = stock_volume_mm3 - volume_mm3
+        stock_weight = stock_volume_m3 * density
+        actual_mass = volume_m3 * density
+        material_cost = stock_weight * cost_per_kg
+
+        # ---------------------------
+        # PERCENTAGES
+        # ---------------------------
+        percentages = db.query(models.TurningPercentages).first()
+        if not percentages:
+            raise HTTPException(status_code=404, detail="Percentages missing")
+
+        roughing_percentage = percentages.roughing_percentage
+        finishing_percentage = percentages.finishing_percentage
+
+        # ---------------------------
+        # PARAMETER MATCHING (FULL OLD LOGIC)
+        # ---------------------------
+        all_params = db.query(models.TurningParameters).filter(
+            models.TurningParameters.material_id == material_id
+        ).all()
+
+        selected_params = None
+
+        for param in all_params:
+            if "-" in param.diameter_range:
+                low, high = map(float, param.diameter_range.split("-"))
+                if low <= stock_diameter <= high:
+                    selected_params = param
+                    break
+            elif ">" in param.diameter_range:
+                threshold = float(param.diameter_range.replace(">", ""))
+                if stock_diameter > threshold:
+                    selected_params = param
+                    break
+            elif "<" in param.diameter_range:
+                threshold = float(param.diameter_range.replace("<", ""))
+                if stock_diameter < threshold:
+                    selected_params = param
+                    break
+
+        if not selected_params:
+            raise HTTPException(status_code=400, detail="No matching parameter")
+
+        # ---------------------------
+        # MRR
+        # ---------------------------
+        roughing_mrr_mm3_min = (
+            selected_params.roughing_feed_rate *
+            selected_params.roughing_depth_of_cut *
+            selected_params.roughing_cutting_speed * 1000
+        )
+
+        finishing_mrr_mm3_min = (
+            selected_params.finishing_feed_rate *
+            selected_params.finishing_depth_of_cut *
+            selected_params.finishing_cutting_speed * 1000
+        )
+
+        # ---------------------------
+        # MACHINING TIME
+        # ---------------------------
+        roughing_time = ((material_removed_mm3 * (roughing_percentage / 100)) / roughing_mrr_mm3_min) / 60
+        finishing_time = (material_removed_mm3 * (finishing_percentage / 100)) / finishing_mrr_mm3_min / 60
+        machining_hours = roughing_time + finishing_time
+
+        # ---------------------------
+        # DATABASE INSERT (FULL OLD FIELDS)
+        # ---------------------------
+        history = models.TurningHistoryDetails(
+            filename=file.filename,
+            length=length,
+            breadth=breadth,
+            height=height,
+            volume_mm3=volume_mm3,
+            volume_m3=volume_m3,
+            material_id=material.id,
+            material_name=material.material,
+            material_specification=material.material_specification,
+            density=material.density,
+            material_cost=material.material_cost,
+            diameter=diameter,
+            axis_length=axis_length,
+            stock_length=stock_length,
+            stock_diameter=stock_diameter,
+            stock_volume_mm3=stock_volume_mm3,
+            stock_volume_m3=stock_volume_m3,
+            material_removed_m3=material_removed_m3,
+            stock_weight_kg=stock_weight,
+            Material_cost=material_cost,
+            roughing_mrr=roughing_mrr_mm3_min,
+            finishing_mrr=finishing_mrr_mm3_min,
+            roughing_time=roughing_time,
+            finishing_time=finishing_time,
+            machining_hours=machining_hours,
+            diameter_range=selected_params.diameter_range,
+            roughing_depth_of_cut=selected_params.roughing_depth_of_cut,
+            roughing_feed_rate=selected_params.roughing_feed_rate,
+            roughing_cutting_speed=selected_params.roughing_cutting_speed,
+            finishing_depth_of_cut=selected_params.finishing_depth_of_cut,
+            finishing_feed_rate=selected_params.finishing_feed_rate,
+            finishing_cutting_speed=selected_params.finishing_cutting_speed,
+        )
+
+        db.add(history)
+        db.commit()
+        db.refresh(history)
+
+        # ---------------------------
+        # RESPONSE (FULL OLD STRUCTURE)
+        # ---------------------------
+        return {
+            "id": history.id,
+            "filename": file.filename,
+            "bounding_box": {
+                "length": length,
+                "breadth": breadth,
+                "height": height,
+            },
+            "volume": {
+                "mm3": volume_mm3,
+                "m3": volume_m3,
+                "actual_mass": actual_mass
+            },
+            "material": {
+                "id": material.id,
+                "name": material.material,
+                "specification": material.material_specification,
+                "density": material.density,
+                "material_cost": material.material_cost
+            },
+            "derived_parameters": {
+                "diameter": diameter,
+                "axis_length": axis_length,
+            },
+            "stock": {
+                "stock_length": stock_length,
+                "stock_diameter": stock_diameter,
+                "stock_volume_mm3": stock_volume_mm3,
+                "stock_volume_m3": stock_volume_m3,
+                "material_removed_m3": material_removed_m3,
+                "stock_weight_kg": stock_weight,
+                "Material_cost": material_cost
+            },
+            "machining": {
+                "roughing_mrr": roughing_mrr_mm3_min,
+                "finishing_mrr": finishing_mrr_mm3_min,
+                "roughing_time": roughing_time,
+                "finishing_time": finishing_time,
+                "machining_hours": machining_hours
+            },
+            "selected_parameters": {
+                "diameter_range": selected_params.diameter_range,
+                "roughing_depth_of_cut": selected_params.roughing_depth_of_cut,
+                "roughing_feed_rate": selected_params.roughing_feed_rate,
+                "roughing_cutting_speed": selected_params.roughing_cutting_speed,
+                "finishing_depth_of_cut": selected_params.finishing_depth_of_cut,
+                "finishing_feed_rate": selected_params.finishing_feed_rate,
+                "finishing_cutting_speed": selected_params.finishing_cutting_speed,
+            }
+        }
+
+    finally:
+        file_path.unlink(missing_ok=True)
